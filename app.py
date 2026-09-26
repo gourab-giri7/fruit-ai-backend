@@ -1,20 +1,16 @@
 from flask import Flask, request, jsonify
-import tensorflow as tf
 from PIL import Image
+from ai_edge_litert.interpreter import Interpreter
+
 import numpy as np
 import os
 
+
 app = Flask(__name__)
 
-model = tf.keras.models.load_model(
-    "fruit_model.keras",
-    custom_objects={
-        "preprocess_input":
-            tf.keras.applications.mobilenet_v2.preprocess_input
-    }
-)
 
-print("Fruit model loaded successfully!")
+MODEL_PATH = "fruit_model.tflite"
+
 
 class_names = [
     "apple",
@@ -29,6 +25,30 @@ class_names = [
 ]
 
 
+# Load model once when server starts
+print("Loading LiteRT model...")
+
+interpreter = Interpreter(model_path=MODEL_PATH)
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+print("LiteRT model loaded successfully!")
+print("Input shape:", input_details[0]["shape"])
+print("Input dtype:", input_details[0]["dtype"])
+print("Output shape:", output_details[0]["shape"])
+print("Output dtype:", output_details[0]["dtype"])
+
+
+@app.route("/", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "online",
+        "message": "Fruit AI API is running"
+    })
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
 
@@ -37,35 +57,71 @@ def predict():
             "error": "no image found"
         }), 400
 
-    image_file = request.files["image"]
+    try:
+        image_file = request.files["image"]
 
-    image = Image.open(image_file).convert("RGB")
-    image = image.resize((224, 224))
+        # Open image
+        image = Image.open(image_file).convert("RGB")
 
-    image_array = np.array(image)
-    image_batch = np.expand_dims(image_array, axis=0)
+        # Resize to model input size
+        image = image.resize((224, 224))
 
-    print("Received image. Starting prediction...")
+        # Convert image to float32
+        image_array = np.array(
+            image,
+            dtype=np.float32
+        )
 
-    predictions = model.predict(
-        image_batch,
-        verbose=0
-    )
+        # Add batch dimension
+        image_batch = np.expand_dims(
+            image_array,
+            axis=0
+        )
 
-    print("Prediction completed.")
+        print("Received image. Starting prediction...")
 
-    predicted_index = int(
-        np.argmax(predictions[0])
-    )
+        # Send image to LiteRT
+        interpreter.set_tensor(
+            input_details[0]["index"],
+            image_batch
+        )
 
-    confidence = float(
-        predictions[0][predicted_index]
-    )
+        # Run inference
+        interpreter.invoke()
 
-    return jsonify({
-        "prediction": class_names[predicted_index],
-        "confidence": confidence
-    })
+        # Get predictions
+        predictions = interpreter.get_tensor(
+            output_details[0]["index"]
+        )
+
+        # Find highest prediction
+        predicted_index = int(
+            np.argmax(predictions[0])
+        )
+
+        confidence = float(
+            predictions[0][predicted_index]
+        )
+
+        prediction = class_names[predicted_index]
+
+        print("Prediction completed.")
+        print("Fruit:", prediction)
+        print("Confidence:", confidence)
+
+        return jsonify({
+            "prediction": prediction,
+            "confidence": confidence
+        })
+
+    except Exception as e:
+
+        print("Prediction error:", e)
+
+        return jsonify({
+            "error": "Prediction failed",
+            "details": str(e)
+        }), 500
 
 
 if __name__ == "__main__":
